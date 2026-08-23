@@ -164,8 +164,15 @@ type RoleSpec struct {
 type ConfigSpec struct {
 	*commonsv1alpha1.RoleGroupConfigSpec `json:",inline"`
 
+	// WarehouseDir is the metastore's warehouse location. Defaults to DefaultWarehouseDir when
+	// unset at both the role group and the role level.
+	//
+	// Deliberately carries no +kubebuilder:default: structural defaulting fills a leaf as soon
+	// as its enclosing object exists, so a CRD default here would be stamped into every role
+	// group that declares `config` for any reason at all (to set resources, say), making a
+	// role-level value impossible to inherit. The default is applied at consumption time
+	// instead — see resolveWarehouseDir.
 	// +kubebuilder:validation:Optional
-	// +kubebuilder:default:="/kubedoop/warehouse"
 	WarehouseDir string `json:"warehouseDir,omitempty"`
 }
 
@@ -246,6 +253,10 @@ func (s *HiveMetastoreSpec) ToGenericSpec() *commonsv1alpha1.GenericClusterSpec 
 			ProductVersion:  s.Image.ProductVersion,
 			KubedoopVersion: s.Image.KubedoopVersion,
 			PullPolicy:      s.Image.PullPolicy,
+			// The CRD has always accepted pullSecretName; the framework now renders it onto the
+			// pod's imagePullSecrets, so it must survive this adapter or a private-registry
+			// install fails with ImagePullBackOff and nothing naming the cause.
+			PullSecretName: s.Image.PullSecretName,
 		}
 	}
 

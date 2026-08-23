@@ -2,11 +2,11 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"maps"
 	"path"
 	"strings"
 
+	commonsv1alpha1 "github.com/zncdatadev/operator-go/pkg/apis/commons/v1alpha1"
 	"github.com/zncdatadev/operator-go/pkg/builder"
 	opgoconfig "github.com/zncdatadev/operator-go/pkg/config"
 	"github.com/zncdatadev/operator-go/pkg/constant"
@@ -15,7 +15,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	hivev1alpha1 "github.com/zncdatadev/hive-operator/api/v1alpha1"
 	hiveconstant "github.com/zncdatadev/hive-operator/internal/constant"
@@ -39,111 +39,239 @@ var _ reconciler.VectorAggregatorProvider = (*hivev1alpha1.HiveMetastore)(nil)
 // HiveRoleGroupHandler builds the metastore role group resources. It embeds the SDK's
 // BaseRoleGroupHandler so the framework owns resource orchestration — ConfigMap (merged config
 // plus the log4j2/vector files), Services, the StatefulSet (with sidecars, security context and
-// overrides applied by the framework) and the role PDB. The override below adds the
-// hive-specific pieces: hive-site/core-site content, the metastore container start script,
-// database/S3/Kerberos wiring and the metrics Service.
+// overrides applied by the framework) and the role PDB. What hive adds is the hive-site/core-site
+// content, the metastore start script, the database/S3/Kerberos wiring and the metrics Service.
 type HiveRoleGroupHandler struct {
 	*reconciler.BaseRoleGroupHandler[*hivev1alpha1.HiveMetastore]
 }
 
-var _ reconciler.RoleGroupHandler[*hivev1alpha1.HiveMetastore] = &HiveRoleGroupHandler{}
+var (
+	_ reconciler.RoleGroupHandler[*hivev1alpha1.HiveMetastore]  = &HiveRoleGroupHandler{}
+	_ reconciler.RoleProvider[*hivev1alpha1.HiveMetastore]      = &HiveRoleGroupHandler{}
+	_ reconciler.RoleGroupResolver[*hivev1alpha1.HiveMetastore] = &HiveRoleGroupHandler{}
+)
 
-// NewHiveRoleGroupHandler creates the handler and configures the framework defaults.
-func NewHiveRoleGroupHandler(scheme *runtime.Scheme) *HiveRoleGroupHandler {
-	base := reconciler.NewBaseRoleGroupHandler[*hivev1alpha1.HiveMetastore]("", scheme)
-
-	// The container name must match the per-container logging key (logging.containers.metastore)
-	// and is asserted by the e2e suite.
-	base.MainContainerName = hivev1alpha1.RoleMetastore
-	base.ExtraLabels["app.kubernetes.io/name"] = "hivemetastore"
-
-	// Declarative logging: the framework renders the log4j2 config into the ConfigMap under the
-	// hive-conventional key (metastore-log4j2.properties) so the metastore start scripts pick it
-	// up from the config directory.
-	base.LoggingContainers = []productlogging.ContainerLogging{
-		{
-			Container: hivev1alpha1.RoleMetastore,
-			Framework: productlogging.LoggingFrameworkLog4j2,
-			FileName:  LogConfigFileName,
-			Pattern:   ConsoleConversionPattern,
-		},
+// ImageDefaults supplies what the CR's spec.image leaves empty. It is re-evaluated every
+// reconcile — which is why KubedoopVersion can be the operator's own build version, so an
+// operator upgrade moves existing clusters onto the co-released product image. Kubedoop
+// publishes Hive images only with the "-kubedoop<version>" suffix, so that field must always
+// resolve to something.
+func ImageDefaults() commonsv1alpha1.ImageSpec {
+	return commonsv1alpha1.ImageSpec{
+		Repo:            hivev1alpha1.DefaultRepository,
+		ProductVersion:  hivev1alpha1.DefaultProductVersion,
+		KubedoopVersion: version.BuildVersion,
 	}
+}
+
+// NewHiveRoleGroupHandler creates the handler. Only reconcile-invariant options live here;
+// everything a role is made of is declared per pass in DeclareRoles.
+func NewHiveRoleGroupHandler(scheme *runtime.Scheme) *HiveRoleGroupHandler {
+	base := reconciler.NewBaseRoleGroupHandler[*hivev1alpha1.HiveMetastore](scheme)
 
 	// configOverrides for *.xml files (hive-site.xml, core-site.xml) render as Hadoop XML.
 	base.ConfigGenerator = opgoconfig.NewMultiFormatConfigGenerator()
 	base.ConfigGenerator.RegisterDefaultFormats()
 
-	base.SetRoleContainerPorts(hivev1alpha1.RoleMetastore, []corev1.ContainerPort{
-		{
-			Name:          hiveconstant.MetastorePortName,
-			ContainerPort: hiveconstant.MetastorePort,
-			Protocol:      corev1.ProtocolTCP,
-		},
-		{
-			Name:          hiveconstant.MetricsPortName,
-			ContainerPort: hiveconstant.MetricsPort,
-			Protocol:      corev1.ProtocolTCP,
-		},
-	})
-	base.SetRoleServicePorts(hivev1alpha1.RoleMetastore, []corev1.ServicePort{
-		{
-			Name:       hiveconstant.MetastorePortName,
-			Port:       hiveconstant.MetastorePort,
-			TargetPort: intstr.FromString(hiveconstant.MetastorePortName),
-			Protocol:   corev1.ProtocolTCP,
-		},
-		{
-			Name:       hiveconstant.MetricsPortName,
-			Port:       hiveconstant.MetricsPort,
-			TargetPort: intstr.FromString(hiveconstant.MetricsPortName),
-			Protocol:   corev1.ProtocolTCP,
-		},
-	})
-
 	return &HiveRoleGroupHandler{BaseRoleGroupHandler: base}
+}
+
+// DeclareRoles implements reconciler.RoleProvider: everything the metastore role is made of,
+// produced once per reconcile pass with the CR in hand.
+//
+// The start script is part of the declaration because it depends on the cluster's S3 and Kerberos
+// configuration, which this hook can resolve — it receives the client. Declaring it here rather
+// than editing the built container is what keeps a user's podOverrides on top: the framework
+// applies declarations first and strategic-merges the user's overrides afterwards.
+func (h *HiveRoleGroupHandler) DeclareRoles(
+	ctx context.Context,
+	k8sClient client.Client,
+	cr *hivev1alpha1.HiveMetastore,
+) (reconciler.RoleCatalog, error) {
+	s3Config, krb5Config, err := h.resolveStorageAndAuth(ctx, k8sClient, cr, hivev1alpha1.RoleMetastore)
+	if err != nil {
+		return nil, err
+	}
+
+	return reconciler.RoleCatalog{
+		hivev1alpha1.RoleMetastore: {
+			// The container name must match the per-container logging key
+			// (logging.containers.metastore) and is asserted by the e2e suite.
+			MainContainerName: hivev1alpha1.RoleMetastore,
+			// The metastore port comes first: ContainerPorts[0] backs the framework's generated
+			// TCP readiness probe, and it is the port that means "this pod can serve".
+			ContainerPorts: []corev1.ContainerPort{
+				{
+					Name:          hiveconstant.MetastorePortName,
+					ContainerPort: hiveconstant.MetastorePort,
+					Protocol:      corev1.ProtocolTCP,
+				},
+				{
+					Name:          hiveconstant.MetricsPortName,
+					ContainerPort: hiveconstant.MetricsPort,
+					Protocol:      corev1.ProtocolTCP,
+				},
+			},
+			ServicePorts: []corev1.ServicePort{
+				{
+					Name:       hiveconstant.MetastorePortName,
+					Port:       hiveconstant.MetastorePort,
+					TargetPort: intstr.FromString(hiveconstant.MetastorePortName),
+					Protocol:   corev1.ProtocolTCP,
+				},
+				{
+					Name:       hiveconstant.MetricsPortName,
+					Port:       hiveconstant.MetricsPort,
+					TargetPort: intstr.FromString(hiveconstant.MetricsPortName),
+					Protocol:   corev1.ProtocolTCP,
+				},
+			},
+			// The entrypoint carries the script inline: arguments are not a declaration field,
+			// because cliOverrides is the user's channel for them.
+			//
+			// Deliberately no `-x`: the script exports S3 credentials read from the mounted
+			// files, and xtrace would echo the expanded secret values into the container log.
+			Command: append([]string{"sh", "-euo", "pipefail", "-c"},
+				h.mainContainerScript(s3Config, krb5Config)),
+			ReadinessProbe: &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString(hiveconstant.MetastorePortName)},
+				},
+				InitialDelaySeconds: 10,
+				PeriodSeconds:       10,
+				FailureThreshold:    5,
+			},
+			// The framework declines to guess a liveness probe for the product's container, so
+			// hive states its own: a TCP check on the metastore port, with a start budget that
+			// clears schema initialisation on a cold database.
+			LivenessProbe: &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString(hiveconstant.MetastorePortName)},
+				},
+				InitialDelaySeconds: 30,
+				PeriodSeconds:       10,
+				FailureThreshold:    5,
+			},
+			// Declarative logging: the framework renders the log4j2 config into the ConfigMap
+			// under the hive-conventional key so the metastore start scripts pick it up from the
+			// config directory, and mounts the shared Vector log volume on this container.
+			LogProducers: []productlogging.ContainerLogging{
+				{
+					Container: hivev1alpha1.RoleMetastore,
+					Framework: productlogging.LoggingFrameworkLog4j2,
+					FileName:  LogConfigFileName,
+					Pattern:   ConsoleConversionPattern,
+				},
+			},
+			Env: h.mainContainerEnv(cr, krb5Config),
+		},
+	}, nil
+}
+
+// ResolveRoleGroup implements reconciler.RoleGroupResolver: the values that follow from a role
+// group's EFFECTIVE config, once the CR's role and role group levels have been folded into one
+// answer. hive's listener class is user-settable, so it can only be applied here — a declaration
+// is fixed before the fold and would beat the user.
+func (h *HiveRoleGroupHandler) ResolveRoleGroup(
+	_ context.Context,
+	_ client.Client,
+	cr *hivev1alpha1.HiveMetastore,
+	_ *reconciler.RoleGroupBuildContext,
+) (*reconciler.Contribution, error) {
+	contribution := &reconciler.Contribution{}
+
+	if cr.Spec.ClusterConfig != nil && cr.Spec.ClusterConfig.ListenerClass != "" {
+		contribution.ListenerClass = cr.Spec.ClusterConfig.ListenerClass
+	}
+
+	// The metastore reads its database user and password from the credentials Secret, which the
+	// JDBC options reference as $(username)/$(password). envFrom is not expressible through the
+	// declaration or the map-shaped override channels, so it travels as a product pod-template
+	// layer folded beneath the user's own podOverrides.
+	if db := databaseSpec(cr); db != nil && db.CredentialsSecret != "" {
+		contribution.PodOverrides = &corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name: hivev1alpha1.RoleMetastore,
+					EnvFrom: []corev1.EnvFromSource{{
+						SecretRef: &corev1.SecretEnvSource{
+							LocalObjectReference: corev1.LocalObjectReference{Name: db.CredentialsSecret},
+						},
+					}},
+				}},
+			},
+		}
+	}
+
+	return contribution, nil
+}
+
+// resolveStorageAndAuth resolves the cluster's S3 connection and Kerberos configuration, both of
+// which shape the start script, the hive-site properties and the CSI volumes.
+func (h *HiveRoleGroupHandler) resolveStorageAndAuth(
+	ctx context.Context,
+	k8sClient client.Client,
+	cr *hivev1alpha1.HiveMetastore,
+	roleName string,
+) (*S3Config, *KerberosConfig, error) {
+	clusterConfig := cr.Spec.ClusterConfig
+	if clusterConfig == nil {
+		return nil, nil, nil
+	}
+
+	var s3Config *S3Config
+	if clusterConfig.S3 != nil {
+		resolved, err := ResolveS3Config(ctx, k8sClient, cr.GetNamespace(), clusterConfig.S3)
+		if err != nil {
+			return nil, nil, err
+		}
+		s3Config = resolved
+	}
+
+	var krb5Config *KerberosConfig
+	if clusterConfig.Authentication != nil && clusterConfig.Authentication.Kerberos != nil {
+		krb5Config = NewKerberosConfig(
+			cr.GetNamespace(),
+			cr.GetName(),
+			roleName,
+			clusterConfig.Authentication.Kerberos.SecretClass,
+		)
+	}
+
+	return s3Config, krb5Config, nil
 }
 
 // BuildResources delegates the bulk to the framework, then applies the hive-specific pieces.
 func (h *HiveRoleGroupHandler) BuildResources(
 	ctx context.Context,
-	k8sClient ctrlclient.Client,
+	k8sClient client.Client,
 	cr *hivev1alpha1.HiveMetastore,
 	buildCtx *reconciler.RoleGroupBuildContext,
 ) (*reconciler.RoleGroupResources, error) {
-	clusterConfig := cr.Spec.ClusterConfig
-
-	// Resolve the CR-driven image before delegating to the framework: the base BuildResources
-	// propagates it to the StatefulSet and the registered sidecars (Vector).
-	h.Image = resolveImage(cr.Spec.Image)
-	if cr.Spec.Image != nil && cr.Spec.Image.PullPolicy != "" {
-		h.ImagePullPolicy = cr.Spec.Image.PullPolicy
+	// The image, its pull policy and the app.kubernetes.io/{name,version} labels are all derived
+	// by the framework from spec.image and GenericReconcilerConfig.ImageResolution. Nothing per-CR
+	// is written onto the handler here: one handler instance serves every HiveMetastore, so a
+	// field written during BuildResources would leak into — or race with — another reconcile.
+	s3Config, krb5Config, err := h.resolveStorageAndAuth(ctx, k8sClient, cr, buildCtx.RoleName)
+	if err != nil {
+		return nil, err
 	}
 
-	var s3Config *S3Config
-	if clusterConfig != nil && clusterConfig.S3 != nil {
-		s3Connection, err := GetS3Connection(ctx, k8sClient, cr.GetNamespace(), clusterConfig.S3)
-		if err != nil {
-			return nil, err
+	// Hand the CSI volumes to the framework so it injects them into the pod and the main
+	// container. VolumeProviders lives on the build context, rebuilt each reconcile, so
+	// registrations never accumulate or leak across CRs.
+	if s3Config != nil {
+		// An anonymous connection has no credentials volume to mount.
+		if provisioner := s3Config.CredentialsProvisioner(); provisioner != nil {
+			buildCtx.VolumeProviders = append(buildCtx.VolumeProviders, provisioner)
 		}
-		s3Config = NewS3Config(s3Connection)
-		buildCtx.VolumeProviders = append(buildCtx.VolumeProviders, s3Config)
 	}
-
-	var krb5Config *KerberosConfig
-	if clusterConfig != nil && clusterConfig.Authentication != nil && clusterConfig.Authentication.Kerberos != nil {
-		krb5Config = NewKerberosConfig(
-			buildCtx.ClusterNamespace,
-			buildCtx.ClusterName,
-			buildCtx.RoleName,
-			clusterConfig.Authentication.Kerberos.SecretClass,
-		)
+	if krb5Config != nil {
 		buildCtx.VolumeProviders = append(buildCtx.VolumeProviders, krb5Config.Provisioner())
 	}
 
 	// Contribute the product-computed configuration as the lowest-precedence layer: keys the
-	// user already set via configOverrides are left untouched, so CRD overrides always win
-	// (the ProductConfig merge semantics, applied here because resolving a referenced
-	// S3Connection needs the Kubernetes client).
+	// user already set via configOverrides are left untouched, so CRD overrides always win.
 	hiveSite := map[string]string{
 		warehouseDirProperty: resolveWarehouseDir(cr.Spec.Metastore, buildCtx.RoleGroupName),
 	}
@@ -164,8 +292,6 @@ func (h *HiveRoleGroupHandler) BuildResources(
 		return nil, err
 	}
 
-	h.customizeStatefulSet(resources, cr, s3Config, krb5Config)
-
 	// Prometheus-scrapable metrics Service ("<resource>-metrics"), asserted by the e2e suite.
 	resources.MetricsService = builder.NewMetricsServiceBuilder(
 		buildCtx.ResourceName,
@@ -178,61 +304,6 @@ func (h *HiveRoleGroupHandler) BuildResources(
 		Build()
 
 	return resources, nil
-}
-
-// customizeStatefulSet applies the metastore container start script, environment and probes on
-// top of the framework-built StatefulSet.
-func (h *HiveRoleGroupHandler) customizeStatefulSet(
-	resources *reconciler.RoleGroupResources,
-	cr *hivev1alpha1.HiveMetastore,
-	s3Config *S3Config,
-	krb5Config *KerberosConfig,
-) {
-	sts := resources.StatefulSet
-	if sts == nil {
-		return
-	}
-
-	containers := sts.Spec.Template.Spec.Containers
-	for i := range containers {
-		if containers[i].Name != hivev1alpha1.RoleMetastore {
-			continue
-		}
-		main := &containers[i]
-
-		main.Command = []string{"sh", "-x", "-euo", "pipefail", "-c"}
-		main.Args = []string{h.mainContainerScript(s3Config, krb5Config)}
-
-		// Product defaults first, framework-applied envOverrides last so overrides win.
-		main.Env = append(h.mainContainerEnv(cr, krb5Config), main.Env...)
-
-		// Credentials for the metastore database, expanded via $(username)/$(password).
-		if db := databaseSpec(cr); db != nil && db.CredentialsSecret != "" {
-			main.EnvFrom = append(main.EnvFrom, corev1.EnvFromSource{
-				SecretRef: &corev1.SecretEnvSource{
-					LocalObjectReference: corev1.LocalObjectReference{Name: db.CredentialsSecret},
-				},
-			})
-		}
-
-		main.ReadinessProbe = &corev1.Probe{
-			ProbeHandler: corev1.ProbeHandler{
-				TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString(hiveconstant.MetastorePortName)},
-			},
-			InitialDelaySeconds: 10,
-			PeriodSeconds:       10,
-			FailureThreshold:    5,
-		}
-		main.LivenessProbe = &corev1.Probe{
-			ProbeHandler: corev1.ProbeHandler{
-				TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString(hiveconstant.MetastorePortName)},
-			},
-			InitialDelaySeconds: 30,
-			PeriodSeconds:       10,
-			FailureThreshold:    5,
-		}
-		break
-	}
 }
 
 // mainContainerScript renders the metastore start script. The config ConfigMap is mounted
@@ -284,12 +355,10 @@ func (h *HiveRoleGroupHandler) mainContainerEnv(cr *hivev1alpha1.HiveMetastore, 
 		)
 	}
 
-	// HADOOP_OPTS carries the JMX prometheus javaagent plus any Kerberos JVM flags.
+	// HADOOP_OPTS carries the JMX prometheus javaagent plus any Kerberos JVM flags. The agent
+	// runs inside the metastore's own JVM and serves the metrics port the Service scrapes.
 	hadoopOpts := []string{
-		fmt.Sprintf("-javaagent:%s=%d:%s",
-			path.Join(constant.KubedoopJmxDir, "jmx_prometheus_javaagent.jar"),
-			hiveconstant.MetricsPort,
-			path.Join(constant.KubedoopJmxDir, "config.yaml")),
+		constant.JMXJavaAgentOpt(hiveconstant.MetricsPort, "config.yaml"),
 	}
 
 	if krb5Config != nil {
@@ -350,30 +419,4 @@ func ensureConfigProperties(buildCtx *reconciler.RoleGroupBuildContext, fileName
 			file[k] = v
 		}
 	}
-}
-
-// resolveImage resolves the metastore container image from the CR spec with the platform
-// defaults (repo, product version) and the operator build version as the kubedoop version.
-func resolveImage(image *hivev1alpha1.ImageSpec) string {
-	if image == nil {
-		image = &hivev1alpha1.ImageSpec{}
-	}
-	if image.Custom != "" {
-		return image.Custom
-	}
-
-	repo := image.Repo
-	if repo == "" {
-		repo = hivev1alpha1.DefaultRepository
-	}
-	productVersion := image.ProductVersion
-	if productVersion == "" {
-		productVersion = hivev1alpha1.DefaultProductVersion
-	}
-	kubedoopVersion := image.KubedoopVersion
-	if kubedoopVersion == "" {
-		kubedoopVersion = version.BuildVersion
-	}
-
-	return fmt.Sprintf("%s/%s:%s-kubedoop%s", repo, hivev1alpha1.DefaultProductName, productVersion, kubedoopVersion)
 }

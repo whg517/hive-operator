@@ -201,11 +201,24 @@ func main() {
 			// replacement GetEventRecorder returns the incompatible events.EventRecorder.
 			Recorder:         mgr.GetEventRecorderFor("hive-metastore-controller"), //nolint:staticcheck
 			RoleGroupHandler: hiveHandler,
-			// Per-CR ServiceAccount naming so multiple clusters in one namespace never fight
-			// over a shared ServiceAccount.
-			ServiceAccountNameFunc: func(cr *hivev1alpha1.HiveMetastore) string {
-				return hivev1alpha1.DefaultProductName + "-" + cr.GetName()
+			// Everything the metastore role is made of — container name, ports, entrypoint,
+			// probes, log producers, env — is declared once per pass with the CR in hand.
+			RoleProvider: hiveHandler,
+			// The listener class and the database credentials envFrom follow from the CR, and are
+			// contributed after the config fold so a user's podOverrides still have the last word.
+			RoleGroupResolver: hiveHandler,
+			// Read every reconcile, so an operator upgrade moves existing clusters onto the
+			// co-released product image. A mutating webhook cannot do this: its defaults are
+			// persisted at admission and never recomputed, freezing kubedoopVersion at whatever
+			// version first admitted the CR. Kubedoop publishes Hive images only with the
+			// "-kubedoop<version>" suffix, so that field must always resolve to something.
+			ImageResolution: reconciler.ImageResolution{
+				ProductName: hivev1alpha1.DefaultProductName,
+				Defaults:    controller.ImageDefaults(),
 			},
+			// The workload ServiceAccount is derived and owned by the framework
+			// ("hivemetastore-<cluster>"); WorkloadRBACRules is left unset because metastore
+			// pods make no Kubernetes API calls of their own.
 			Prototype: &hivev1alpha1.HiveMetastore{},
 		})
 	if err != nil {
